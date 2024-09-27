@@ -10,40 +10,48 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - tag: latest
-            architectures: linux/386,linux/amd64,linux/arm/v5,linux/arm/v7,linux/arm64/v8,linux/mips64le,linux/ppc64le,linux/s390x
-          - tag: fpm
-            architectures: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8,linux/ppc64le,linux/s390x
-          - tag: fpm-alpine
-            architectures: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8,linux/ppc64le,linux/s390x
+        tag: ['latest', 'fpm', 'fpm-alpine']
+      fail-fast: false
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Check if Nextcloud Image Updated
-        id: nextcloud_update_check
-        uses: lucacome/docker-image-update-checker@v1
-        with:
-          base-image: "nextcloud:${{ matrix.tag }}"
-          image: "${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${{ matrix.tag }}"
+      - name: Check for upstream updates and get architectures
+        id: upstream_check
+        run: |
+          base_manifest=$(docker manifest inspect nextcloud:${{ matrix.tag }})
+          our_manifest=$(docker manifest inspect ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${{ matrix.tag }} 2>/dev/null || echo '{"manifests":[]}')
+          
+          base_digest=$(echo "$base_manifest" | jq -r '.manifests[0].digest // ""')
+          our_digest=$(echo "$our_manifest" | jq -r '.manifests[0].digest // ""')
+          
+          if [[ -n "$base_digest" && "$base_digest" != "$our_digest" ]]; then
+            echo "needs_updating=true" >> $GITHUB_OUTPUT
+            archs=$(echo "$base_manifest" | jq -r '.manifests[].platform | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq | tr '\n' ',' | sed 's/,$//')
+            echo "architectures=$archs" >> $GITHUB_OUTPUT
+          else
+            echo "needs_updating=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Login to DockerHub
-        if: steps.nextcloud_update_check.outputs.needs-updating == 'true'
+        if: steps.upstream_check.outputs.needs_updating == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up QEMU
+        if: steps.upstream_check.outputs.needs_updating == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        if: steps.upstream_check.outputs.needs_updating == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build and Push Nextcloud Image
-        if: steps.nextcloud_update_check.outputs.needs-updating == 'true'
-        uses: docker/build-push-action@v4
+        if: steps.upstream_check.outputs.needs_updating == 'true'
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
@@ -52,6 +60,6 @@ jobs:
             TAG=${{ matrix.tag }}
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${{ matrix.tag }}
-          platforms: ${{ matrix.architectures }}
+          platforms: ${{ steps.upstream_check.outputs.architectures }}
           cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:cache
           cache-to: type=inline,mode=max,ref=${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:cache
