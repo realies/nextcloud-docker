@@ -6,40 +6,133 @@ on:
   workflow_dispatch:
 
 jobs:
+  fetch-and-group-tags:
+    runs-on: ubuntu-latest
+    outputs:
+      unique-digests: ${{ steps.group-tags.outputs.unique-digests }}
+      digest-tags: ${{ steps.group-tags.outputs.digest-tags }}
+      digest-arch: ${{ steps.group-tags.outputs.digest-arch }}
+      digest-os: ${{ steps.group-tags.outputs.digest-os }}
+    steps:
+      - name: Fetch and group Nextcloud tags
+        id: group-tags
+        run: |
+          fetch_tags() {
+            local page=$1
+            curl -s -f "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100&page=$page"
+          }
+
+          process_tags() {
+            jq -r --arg date "$(date -d '1 month ago' +'%Y-%m-%d')" '.results[]? | select(.last_updated >= $date) | .name as $name | .images[] | [$name, .digest, .architecture, .os] | @tsv'
+          }
+
+          page=1
+          all_tags=""
+          while true; do
+            response=$(fetch_tags $page)
+            if [ $? -ne 0 ]; then
+              echo "Error fetching tags for page $page"
+              exit 1
+            fi
+            new_tags=$(echo "$response" | process_tags)
+            if [ -z "$new_tags" ]; then
+              echo "No more tags found on page $page"
+              break
+            fi
+            all_tags+="$new_tags"$'\n'
+            echo "Fetched $(echo "$new_tags" | wc -l) tags from page $page"
+            page=$((page + 1))
+          done
+
+          if [ -z "$all_tags" ]; then
+            echo "No tags were fetched"
+            exit 1
+          fi
+
+          echo "Total tags fetched: $(echo "$all_tags" | wc -l)"
+
+          # Group by digest and collect tags, arch, and os
+          grouped_data=$(echo "$all_tags" | awk -F'\t' '{
+            if ($2 != "" && !($2 in digests)) {
+              digests[$2] = $1
+              arch[$2] = $3
+              os[$2] = $4
+            } else if ($2 != "") {
+              digests[$2] = digests[$2] "," $1
+            }
+          } END {
+            for (d in digests) {
+              print d "|" digests[d] "|" arch[d] "|" os[d]
+            }
+          }')
+
+          # Prepare outputs
+          unique_digests=$(echo "$grouped_data" | cut -d'|' -f1 | jq -R -s -c 'split("\n")[:-1]')
+          digest_tags=$(echo "$grouped_data" | cut -d'|' -f2 | jq -R -s -c 'split("\n")[:-1]')
+          digest_arch=$(echo "$grouped_data" | cut -d'|' -f3 | jq -R -s -c 'split("\n")[:-1]')
+          digest_os=$(echo "$grouped_data" | cut -d'|' -f4 | jq -R -s -c 'split("\n")[:-1]')
+
+          echo "unique-digests=$unique_digests" >> $GITHUB_OUTPUT
+          echo "digest-tags=$digest_tags" >> $GITHUB_OUTPUT
+          echo "digest-arch=$digest_arch" >> $GITHUB_OUTPUT
+          echo "digest-os=$digest_os" >> $GITHUB_OUTPUT
+
+          echo "Number of unique digests: $(echo "$unique_digests" | jq '. | length')"
+
   update-nextcloud:
+    needs: fetch-and-group-tags
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        tag: ['latest', 'fpm', 'fpm-alpine']
+        index: ${{ fromJson(needs.fetch-and-group-tags.outputs.unique-digests) }}
       fail-fast: false
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Check for upstream updates and get architectures
-        id: upstream_check
+      - name: Get image details
+        id: details
         run: |
-          base_manifest=$(docker manifest inspect nextcloud:${{ matrix.tag }})
-          our_manifest=$(docker manifest inspect ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${{ matrix.tag }} 2>/dev/null || echo '{"manifests":[]}')
-          
-          base_digest=$(echo "$base_manifest" | jq -r '.manifests[0].digest // ""')
-          our_digest=$(echo "$our_manifest" | jq -r '.manifests[0].digest // ""')
-          
-          if [[ -n "$base_digest" && "$base_digest" != "$our_digest" ]]; then
-            echo "needs_updating=true" >> $GITHUB_OUTPUT
-            archs=$(echo "$base_manifest" | jq -r '.manifests[].platform | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq | tr '\n' ',' | sed 's/,$//')
-            echo "architectures=$archs" >> $GITHUB_OUTPUT
-          else
-            echo "needs_updating=false" >> $GITHUB_OUTPUT
-          fi
+          digest='${{ matrix.index }}'
+          index=$(echo '${{ needs.fetch-and-group-tags.outputs.unique-digests }}' | jq -r 'index("'"$digest"'")')
+          tags=$(echo '${{ needs.fetch-and-group-tags.outputs.digest-tags }}' | jq -r ".[$index]")
+          arch=$(echo '${{ needs.fetch-and-group-tags.outputs.digest-arch }}' | jq -r ".[$index]")
+          os=$(echo '${{ needs.fetch-and-group-tags.outputs.digest-os }}' | jq -r ".[$index]")
+          echo "digest=$digest" >> $GITHUB_OUTPUT
+          echo "tags=$tags" >> $GITHUB_OUTPUT
+          echo "arch=$arch" >> $GITHUB_OUTPUT
+          echo "os=$os" >> $GITHUB_OUTPUT
 
       - name: Login to DockerHub
-        if: steps.upstream_check.outputs.needs_updating == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check for upstream updates
+        id: upstream_check
+        run: |
+          if [ -z "${{ steps.details.outputs.tags }}" ]; then
+            echo "No tags found for this digest. Skipping."
+            echo "needs_updating=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          IFS=',' read -ra tag_array <<< "${{ steps.details.outputs.tags }}"
+          primary_tag="${tag_array[0]}"
+          
+          base_manifest=$(docker manifest inspect nextcloud:$primary_tag)
+          our_manifest=$(docker manifest inspect ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:$primary_tag 2>/dev/null || echo '{"manifests":[]}')
+          
+          base_digest=$(echo "$base_manifest" | jq -r '.manifests[] | select(.platform.architecture == "${{ steps.details.outputs.arch }}" and .platform.os == "${{ steps.details.outputs.os }}") | .digest // ""')
+          our_digest=$(echo "$our_manifest" | jq -r '.manifests[] | select(.platform.architecture == "${{ steps.details.outputs.arch }}" and .platform.os == "${{ steps.details.outputs.os }}") | .digest // ""')
+          
+          if [[ -n "$base_digest" && "$base_digest" != "$our_digest" ]]; then
+            echo "needs_updating=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_updating=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set up QEMU
         if: steps.upstream_check.outputs.needs_updating == 'true'
@@ -49,6 +142,20 @@ jobs:
         if: steps.upstream_check.outputs.needs_updating == 'true'
         uses: docker/setup-buildx-action@v3
 
+      - name: Prepare tags
+        if: steps.upstream_check.outputs.needs_updating == 'true'
+        id: prepare
+        run: |
+          IFS=',' read -ra tag_array <<< "${{ steps.details.outputs.tags }}"
+          tags=""
+          for tag in "${tag_array[@]}"; do
+            if [ -n "$tags" ]; then
+              tags="${tags},"
+            fi
+            tags="${tags}${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${tag}"
+          done
+          echo "tags=$tags" >> $GITHUB_OUTPUT
+
       - name: Build and Push Nextcloud Image
         if: steps.upstream_check.outputs.needs_updating == 'true'
         uses: docker/build-push-action@v6
@@ -57,9 +164,9 @@ jobs:
           file: Dockerfile
           build-args: |
             IMAGE=nextcloud
-            TAG=${{ matrix.tag }}
+            TAG=${{ fromJson(format('[{0}]', steps.details.outputs.tags))[0] }}
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${{ matrix.tag }}
-          platforms: ${{ steps.upstream_check.outputs.architectures }}
+          tags: ${{ steps.prepare.outputs.tags }}
+          platforms: ${{ steps.details.outputs.os }}/${{ steps.details.outputs.arch }}
           cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:cache
           cache-to: type=inline,mode=max,ref=${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:cache
