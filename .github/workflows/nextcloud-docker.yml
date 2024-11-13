@@ -8,6 +8,8 @@ on:
 jobs:
   update-nextcloud:
     runs-on: ubuntu-latest
+    env:
+      BUILDX_NO_DEFAULT_ATTESTATIONS: 1
     strategy:
       matrix:
         tag: ['latest', 'fpm', 'fpm-alpine']
