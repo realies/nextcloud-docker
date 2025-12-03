@@ -11,7 +11,10 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Detect image:tag combinations
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Detect image:tag combinations with ffmpeg support
         id: set-matrix
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -42,17 +45,49 @@ jobs:
               
               # Only rebuild if base image has changed or we don't have the image yet
               if [[ -n "$base_digest" && "$base_digest" != "$stored_base_digest" ]]; then
-                archs=$(echo "$manifest" | jq -r '.manifests[].platform | select(.os != "unknown" and .architecture != "unknown") | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq)
-                combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$(echo $archs | tr '\n' ','),\",\"base_digest\":\"$base_digest\"}")
+                # Get all architectures from manifest
+                all_archs=$(echo "$manifest" | jq -r '.manifests[].platform | select(.os != "unknown" and .architecture != "unknown") | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq)
+                
+                # Test ffmpeg availability for each architecture
+                supported_archs=()
+                is_alpine=$(echo "$tag" | grep -q "alpine" && echo "true" || echo "false")
+                
+                for arch in $all_archs; do
+                  echo "Testing ffmpeg on $tag for $arch..."
+                  if [ "$is_alpine" = "true" ]; then
+                    # Alpine: test with apk
+                    if docker run --rm --platform="$arch" alpine:latest sh -c "apk add --no-cache --simulate ffmpeg" 2>/dev/null; then
+                      echo "  ✓ ffmpeg available for $arch"
+                      supported_archs+=("$arch")
+                    else
+                      echo "  ✗ ffmpeg NOT available for $arch, skipping"
+                    fi
+                  else
+                    # Debian: test with apt
+                    if docker run --rm --platform="$arch" debian:bookworm-slim sh -c "apt-get update && apt-cache show ffmpeg" 2>/dev/null | grep -q "Package: ffmpeg"; then
+                      echo "  ✓ ffmpeg available for $arch"
+                      supported_archs+=("$arch")
+                    else
+                      echo "  ✗ ffmpeg NOT available for $arch, skipping"
+                    fi
+                  fi
+                done
+                
+                if [ ${#supported_archs[@]} -gt 0 ]; then
+                  platforms=$(IFS=,; echo "${supported_archs[*]}")
+                  combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$platforms\",\"base_digest\":\"$base_digest\"}")
+                else
+                  echo "No supported architectures for $tag, skipping entirely"
+                fi
               fi
             fi
           done
-          echo "matrix={\"include\":[$(echo ${combinations[@]} | tr ' ' ',')]}" >> $GITHUB_OUTPUT
+          echo "matrix={\"include\":[$(IFS=,; echo "${combinations[*]}")]}" >> $GITHUB_OUTPUT
 
   build:
     needs: detect
     runs-on: ubuntu-latest
-    if: ${{ needs.detect.outputs.matrix != '{"include":[]}' && needs.detect.outputs.matrix != '{"include":[,]}' }}
+    if: ${{ needs.detect.outputs.matrix != '{"include":[]}' && needs.detect.outputs.matrix != '{"include":[,]}' && needs.detect.outputs.matrix != '{"include":[]}' }}
     strategy:
       matrix: ${{fromJson(needs.detect.outputs.matrix)}}
       fail-fast: false
