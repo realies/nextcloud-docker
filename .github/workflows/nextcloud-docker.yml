@@ -19,6 +19,40 @@ jobs:
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
+          # Cache for ffmpeg availability: alpine_<arch>=1/0, debian_<arch>=1/0
+          declare -A ffmpeg_cache
+          
+          test_ffmpeg() {
+            local arch="$1"
+            local is_alpine="$2"
+            local cache_key="${is_alpine}_${arch//\//_}"
+            
+            # Return cached result if available
+            if [[ -n "${ffmpeg_cache[$cache_key]}" ]]; then
+              return ${ffmpeg_cache[$cache_key]}
+            fi
+            
+            echo "Testing ffmpeg for $arch ($( [ "$is_alpine" = "true" ] && echo "Alpine" || echo "Debian"))..."
+            local result=1
+            if [ "$is_alpine" = "true" ]; then
+              if docker run --rm --platform="$arch" alpine:latest sh -c "apk add --no-cache --simulate ffmpeg" >/dev/null 2>&1; then
+                result=0
+              fi
+            else
+              if docker run --rm --platform="$arch" debian:bookworm-slim sh -c "apt-get update >/dev/null 2>&1 && apt-cache show ffmpeg 2>/dev/null" | grep -q "Package: ffmpeg"; then
+                result=0
+              fi
+            fi
+            
+            ffmpeg_cache[$cache_key]=$result
+            if [ $result -eq 0 ]; then
+              echo "  ✓ ffmpeg available"
+            else
+              echo "  ✗ ffmpeg NOT available, will skip this arch"
+            fi
+            return $result
+          }
+          
           combinations=()
           # Get available tags and filter out versioned ones
           tags=$(curl -s "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100" | \
@@ -45,39 +79,30 @@ jobs:
               
               # Only rebuild if base image has changed or we don't have the image yet
               if [[ -n "$base_digest" && "$base_digest" != "$stored_base_digest" ]]; then
+                echo "Processing tag: $tag"
                 # Get all architectures from manifest
                 all_archs=$(echo "$manifest" | jq -r '.manifests[].platform | select(.os != "unknown" and .architecture != "unknown") | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq)
                 
-                # Test ffmpeg availability for each architecture
-                supported_archs=()
-                is_alpine=$(echo "$tag" | grep -q "alpine" && echo "true" || echo "false")
+                # Determine if alpine or debian based
+                is_alpine="false"
+                if echo "$tag" | grep -q "alpine"; then
+                  is_alpine="true"
+                fi
                 
+                # Filter architectures based on ffmpeg availability (using cache)
+                supported_archs=()
                 for arch in $all_archs; do
-                  echo "Testing ffmpeg on $tag for $arch..."
-                  if [ "$is_alpine" = "true" ]; then
-                    # Alpine: test with apk
-                    if docker run --rm --platform="$arch" alpine:latest sh -c "apk add --no-cache --simulate ffmpeg" 2>/dev/null; then
-                      echo "  ✓ ffmpeg available for $arch"
-                      supported_archs+=("$arch")
-                    else
-                      echo "  ✗ ffmpeg NOT available for $arch, skipping"
-                    fi
-                  else
-                    # Debian: test with apt
-                    if docker run --rm --platform="$arch" debian:bookworm-slim sh -c "apt-get update && apt-cache show ffmpeg" 2>/dev/null | grep -q "Package: ffmpeg"; then
-                      echo "  ✓ ffmpeg available for $arch"
-                      supported_archs+=("$arch")
-                    else
-                      echo "  ✗ ffmpeg NOT available for $arch, skipping"
-                    fi
+                  if test_ffmpeg "$arch" "$is_alpine"; then
+                    supported_archs+=("$arch")
                   fi
                 done
                 
                 if [ ${#supported_archs[@]} -gt 0 ]; then
                   platforms=$(IFS=,; echo "${supported_archs[*]}")
                   combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$platforms\",\"base_digest\":\"$base_digest\"}")
+                  echo "  → $tag: ${#supported_archs[@]} architectures"
                 else
-                  echo "No supported architectures for $tag, skipping entirely"
+                  echo "  → $tag: No supported architectures, skipping"
                 fi
               fi
             fi
