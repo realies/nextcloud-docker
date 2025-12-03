@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Detect image:tag combinations
         id: set-matrix
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           combinations=()
           # Get available tags and filter out versioned ones
@@ -20,15 +22,28 @@ jobs:
                 jq -r '.results[].name | select(test("^[0-9]") | not)')
           
           for tag in $tags; do
-            manifest=$(docker manifest inspect nextcloud:$tag)
+            manifest=$(docker manifest inspect nextcloud:$tag 2>/dev/null)
             if [ $? -eq 0 ]; then
-              our_manifest=$(docker manifest inspect ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:$tag 2>/dev/null || echo '{"manifests":[]}')
+              # Get the current base image digest
               base_digest=$(echo "$manifest" | jq -r '.manifests[0].digest // ""')
-              our_digest=$(echo "$our_manifest" | jq -r '.manifests[0].digest // ""')
               
-              if [[ -n "$base_digest" && "$base_digest" != "$our_digest" ]]; then
+              # Get the base digest label stored in our image (if it exists)
+              token=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${DOCKERHUB_USERNAME}/nextcloud:pull" | jq -r '.token')
+              our_config=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$tag" 2>/dev/null)
+              config_digest=$(echo "$our_config" | jq -r '.config.digest // ""')
+              
+              stored_base_digest=""
+              if [[ -n "$config_digest" && "$config_digest" != "null" ]]; then
+                config_blob=$(curl -s -H "Authorization: Bearer $token" \
+                  "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/blobs/$config_digest" 2>/dev/null)
+                stored_base_digest=$(echo "$config_blob" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // ""')
+              fi
+              
+              # Only rebuild if base image has changed or we don't have the image yet
+              if [[ -n "$base_digest" && "$base_digest" != "$stored_base_digest" ]]; then
                 archs=$(echo "$manifest" | jq -r '.manifests[].platform | select(.os != "unknown" and .architecture != "unknown") | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq)
-                combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$(echo $archs | tr '\n' ',')\"}")
+                combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$(echo $archs | tr '\n' ','),\",\"base_digest\":\"$base_digest\"}")
               fi
             fi
           done
@@ -37,6 +52,7 @@ jobs:
   build:
     needs: detect
     runs-on: ubuntu-latest
+    if: ${{ needs.detect.outputs.matrix != '{"include":[]}' && needs.detect.outputs.matrix != '{"include":[,]}' }}
     strategy:
       matrix: ${{fromJson(needs.detect.outputs.matrix)}}
       fail-fast: false
@@ -70,3 +86,5 @@ jobs:
           platforms: ${{ matrix.platforms }}
           provenance: false
           sbom: false
+          labels: |
+            org.opencontainers.image.base.digest=${{ matrix.base_digest }}
