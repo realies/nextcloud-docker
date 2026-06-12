@@ -163,9 +163,15 @@ jobs:
             org.opencontainers.image.base.digest=${{ matrix.base_digest }}
 
       - name: Export image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
+          digest="$DIGEST"
+          if [ -z "$digest" ]; then
+            echo "Build did not produce an image digest"
+            exit 1
+          fi
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload image digest
@@ -204,15 +210,17 @@ jobs:
       - name: Create and Push Multi-Arch Manifest
         env:
           IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud
+          TAG: ${{ matrix.tag }}
+          PLATFORMS: ${{ matrix.platforms }}
         run: |
-          IFS=',' read -r -a expected_platforms <<< "${{ matrix.platforms }}"
+          IFS=',' read -r -a expected_platforms <<< "$PLATFORMS"
           mapfile -t digest_files < <(find /tmp/digests -type f | sort)
           if [ ${#digest_files[@]} -eq 0 ]; then
-            echo "No image digests found for ${{ matrix.tag }}"
+            echo "No image digests found for $TAG"
             exit 1
           fi
           if [ ${#digest_files[@]} -ne ${#expected_platforms[@]} ]; then
-            echo "Expected ${#expected_platforms[@]} image digests for ${{ matrix.tag }} (${{ matrix.platforms }}), found ${#digest_files[@]}"
+            echo "Expected ${#expected_platforms[@]} image digests for $TAG ($PLATFORMS), found ${#digest_files[@]}"
             printf 'Found digest file: %s\n' "${digest_files[@]}"
             exit 1
           fi
@@ -223,5 +231,5 @@ jobs:
           done
 
           docker buildx imagetools create \
-            --tag "${IMAGE}:${{ matrix.tag }}" \
+            --tag "${IMAGE}:${TAG}" \
             "${refs[@]}"
