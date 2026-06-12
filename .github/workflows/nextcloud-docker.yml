@@ -9,7 +9,8 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
+      merge_matrix: ${{ steps.set-matrix.outputs.merge_matrix }}
     steps:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -53,7 +54,8 @@ jobs:
             return $result
           }
           
-          combinations=()
+          build_combinations=()
+          merge_combinations=()
           # Get available tags and filter out versioned ones
           tags=$(curl -s "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100" | \
                 jq -r '.results[].name | select(test("^[0-9]") | not)')
@@ -66,8 +68,13 @@ jobs:
               
               # Get the base digest label stored in our image (if it exists)
               token=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${DOCKERHUB_USERNAME}/nextcloud:pull" | jq -r '.token')
-              our_config=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              our_config=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
                 "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$tag" 2>/dev/null)
+              manifest_digest=$(echo "$our_config" | jq -r '.manifests[0].digest // ""')
+              if [[ -n "$manifest_digest" && "$manifest_digest" != "null" ]]; then
+                our_config=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+                  "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$manifest_digest" 2>/dev/null)
+              fi
               config_digest=$(echo "$our_config" | jq -r '.config.digest // ""')
               
               stored_base_digest=""
@@ -99,7 +106,11 @@ jobs:
                 
                 if [ ${#supported_archs[@]} -gt 0 ]; then
                   platforms=$(IFS=,; echo "${supported_archs[*]}")
-                  combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$platforms\",\"base_digest\":\"$base_digest\"}")
+                  merge_combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$platforms\",\"base_digest\":\"$base_digest\"}")
+                  for arch in "${supported_archs[@]}"; do
+                    platform_slug="${arch//\//-}"
+                    build_combinations+=("{\"tag\":\"$tag\",\"platform\":\"$arch\",\"platform_slug\":\"$platform_slug\",\"base_digest\":\"$base_digest\"}")
+                  done
                   echo "  → $tag: ${#supported_archs[@]} architectures"
                 else
                   echo "  → $tag: No supported architectures, skipping"
@@ -107,15 +118,17 @@ jobs:
               fi
             fi
           done
-          echo "matrix={\"include\":[$(IFS=,; echo "${combinations[*]}")]}" >> $GITHUB_OUTPUT
+          echo "build_matrix={\"include\":[$(IFS=,; echo "${build_combinations[*]}")]}" >> $GITHUB_OUTPUT
+          echo "merge_matrix={\"include\":[$(IFS=,; echo "${merge_combinations[*]}")]}" >> $GITHUB_OUTPUT
 
   build:
     needs: detect
     runs-on: ubuntu-latest
-    if: ${{ needs.detect.outputs.matrix != '{"include":[]}' && needs.detect.outputs.matrix != '{"include":[,]}' && needs.detect.outputs.matrix != '{"include":[]}' }}
+    if: ${{ needs.detect.outputs.build_matrix != '{"include":[]}' }}
     strategy:
-      matrix: ${{fromJson(needs.detect.outputs.matrix)}}
+      matrix: ${{fromJson(needs.detect.outputs.build_matrix)}}
       fail-fast: false
+      max-parallel: 6
 
     steps:
       - name: Checkout repo
@@ -134,6 +147,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and Push Nextcloud Image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -141,10 +155,67 @@ jobs:
           build-args: |
             IMAGE=nextcloud
             TAG=${{ matrix.tag }}
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud:${{ matrix.tag }}
-          platforms: ${{ matrix.platforms }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/nextcloud,push-by-digest=true,name-canonical=true,push=true
           provenance: false
           sbom: false
           labels: |
             org.opencontainers.image.base.digest=${{ matrix.base_digest }}
+
+      - name: Export image digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.tag }}--${{ matrix.platform_slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    if: ${{ needs.detect.outputs.merge_matrix != '{"include":[]}' }}
+    strategy:
+      matrix: ${{fromJson(needs.detect.outputs.merge_matrix)}}
+      fail-fast: false
+
+    steps:
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.tag }}--*
+          merge-multiple: true
+
+      - name: Create and Push Multi-Arch Manifest
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud
+        run: |
+          mapfile -t digest_files < <(find /tmp/digests -type f | sort)
+          if [ ${#digest_files[@]} -eq 0 ]; then
+            echo "No image digests found for ${{ matrix.tag }}"
+            exit 1
+          fi
+
+          refs=()
+          for digest_file in "${digest_files[@]}"; do
+            refs+=("${IMAGE}@sha256:$(basename "$digest_file")")
+          done
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${{ matrix.tag }}" \
+            "${refs[@]}"

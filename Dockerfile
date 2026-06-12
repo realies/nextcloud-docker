@@ -1,5 +1,5 @@
-ARG IMAGE
-ARG TAG
+ARG IMAGE=nextcloud
+ARG TAG=latest
 
 FROM ${IMAGE}:${TAG}
 
