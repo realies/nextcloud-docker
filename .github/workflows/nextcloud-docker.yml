@@ -10,116 +10,142 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
-      merge_matrix: ${{ steps.set-matrix.outputs.merge_matrix }}
     steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Detect image:tag combinations with ffmpeg support
         id: set-matrix
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          # Cache for ffmpeg availability: alpine_<arch>=1/0, debian_<arch>=1/0
-          declare -A ffmpeg_cache
-          
-          test_ffmpeg() {
+          supports_ffmpeg() {
             local arch="$1"
             local is_alpine="$2"
-            local cache_key="${is_alpine}_${arch//\//_}"
-            
-            # Return cached result if available
-            if [[ -n "${ffmpeg_cache[$cache_key]}" ]]; then
-              return ${ffmpeg_cache[$cache_key]}
-            fi
-            
-            echo "Testing ffmpeg for $arch ($( [ "$is_alpine" = "true" ] && echo "Alpine" || echo "Debian"))..."
-            local result=1
             if [ "$is_alpine" = "true" ]; then
-              if docker run --rm --platform="$arch" alpine:latest sh -c "apk add --no-cache --simulate ffmpeg" >/dev/null 2>&1; then
-                result=0
-              fi
+              case "$arch" in
+                linux/386|linux/amd64|linux/arm/v6|linux/arm/v7|linux/arm64/v8|linux/ppc64le|linux/riscv64|linux/s390x)
+                  return 0
+                  ;;
+              esac
             else
-              if docker run --rm --platform="$arch" debian:bookworm-slim sh -c "apt-get update >/dev/null 2>&1 && apt-cache show ffmpeg 2>/dev/null" | grep -q "Package: ffmpeg"; then
-                result=0
-              fi
+              case "$arch" in
+                linux/386|linux/amd64|linux/arm/v5|linux/arm/v7|linux/arm64/v8|linux/ppc64le|linux/s390x)
+                  return 0
+                  ;;
+              esac
             fi
-            
-            ffmpeg_cache[$cache_key]=$result
-            if [ $result -eq 0 ]; then
-              echo "  ✓ ffmpeg available"
-            else
-              echo "  ✗ ffmpeg NOT available, will skip this arch"
-            fi
-            return $result
+
+            return 1
           }
-          
+
+          registry_get() {
+            local accept="$1"
+            local url="$2"
+            local output_file="$3"
+            local http_code
+            http_code=$(curl -sS -o "$output_file" -w "%{http_code}" \
+              -H "Authorization: Bearer $token" \
+              -H "Accept: $accept" \
+              "$url") || http_code="000"
+
+            if [[ "$http_code" =~ ^2 ]]; then
+              return 0
+            fi
+            if [ "$http_code" = "404" ]; then
+              return 1
+            fi
+
+            echo "Docker Hub registry request failed with HTTP $http_code: $url"
+            cat "$output_file"
+            exit 1
+          }
+
           build_combinations=()
-          merge_combinations=()
           # Get available tags and filter out versioned ones
-          tags=$(curl -s "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100" | \
-                jq -r '.results[].name | select(test("^[0-9]") | not)')
-          
+          tags=$(curl -fsSL "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100" | \
+            jq -r '.results[].name | select(test("^[0-9]") | not)')
+
+          token=$(curl -fsSL -u "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${DOCKERHUB_USERNAME}/nextcloud:pull" | jq -r '.token')
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "Failed to obtain Docker Hub registry token"
+            exit 1
+          fi
+
           for tag in $tags; do
-            manifest=$(docker manifest inspect nextcloud:$tag 2>/dev/null)
-            if [ $? -eq 0 ]; then
-              # Get the current base image digest
-              base_digest=$(echo "$manifest" | jq -r '.manifests[0].digest // ""')
-              
-              # Get the base digest label stored in our image (if it exists)
-              token=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${DOCKERHUB_USERNAME}/nextcloud:pull" | jq -r '.token')
-              our_config=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
-                "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$tag" 2>/dev/null)
-              manifest_digest=$(echo "$our_config" | jq -r '.manifests[0].digest // ""')
+            if ! manifest=$(docker manifest inspect "nextcloud:$tag" 2>/tmp/nextcloud-manifest-error); then
+              echo "Failed to inspect nextcloud:$tag"
+              cat /tmp/nextcloud-manifest-error
+              exit 1
+            fi
+
+            # Get the current base image digest
+            base_digest=$(echo "$manifest" | jq -r '.manifests[0].digest // ""')
+
+            # Get the base digest label stored in our image (if it exists)
+            our_manifest_file=$(mktemp)
+            stored_base_digest=""
+            if registry_get \
+              "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+              "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$tag" \
+              "$our_manifest_file"; then
+              manifest_digest=$(jq -r '.manifests[0].digest // ""' "$our_manifest_file")
               if [[ -n "$manifest_digest" && "$manifest_digest" != "null" ]]; then
-                our_config=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
-                  "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$manifest_digest" 2>/dev/null)
+                child_manifest_file=$(mktemp)
+                registry_get \
+                  "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+                  "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/manifests/$manifest_digest" \
+                  "$child_manifest_file"
+                config_digest=$(jq -r '.config.digest // ""' "$child_manifest_file")
+              else
+                config_digest=$(jq -r '.config.digest // ""' "$our_manifest_file")
               fi
-              config_digest=$(echo "$our_config" | jq -r '.config.digest // ""')
-              
-              stored_base_digest=""
+
               if [[ -n "$config_digest" && "$config_digest" != "null" ]]; then
-                config_blob=$(curl -s -H "Authorization: Bearer $token" \
-                  "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/blobs/$config_digest" 2>/dev/null)
-                stored_base_digest=$(echo "$config_blob" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // ""')
+                config_blob_file=$(mktemp)
+                registry_get \
+                  "application/vnd.docker.container.image.v1+json, application/vnd.oci.image.config.v1+json" \
+                  "https://registry-1.docker.io/v2/${DOCKERHUB_USERNAME}/nextcloud/blobs/$config_digest" \
+                  "$config_blob_file"
+                stored_base_digest=$(jq -r '.config.Labels["org.opencontainers.image.base.digest"] // ""' "$config_blob_file")
               fi
-              
-              # Only rebuild if base image has changed or we don't have the image yet
-              if [[ -n "$base_digest" && "$base_digest" != "$stored_base_digest" ]]; then
-                echo "Processing tag: $tag"
-                # Get all architectures from manifest
-                all_archs=$(echo "$manifest" | jq -r '.manifests[].platform | select(.os != "unknown" and .architecture != "unknown") | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq)
-                
-                # Determine if alpine or debian based
-                is_alpine="false"
-                if echo "$tag" | grep -q "alpine"; then
-                  is_alpine="true"
+            fi
+
+            # Only rebuild if base image has changed or we don't have the image yet
+            if [[ -n "$base_digest" && "$base_digest" != "$stored_base_digest" ]]; then
+              echo "Processing tag: $tag"
+              # Get all architectures from manifest
+              all_archs=$(echo "$manifest" | jq -r '.manifests[].platform | select(.os != "unknown" and .architecture != "unknown") | .os + "/" + .architecture + if .variant then "/" + .variant else "" end' | sort | uniq)
+
+              # Determine if alpine or debian based
+              is_alpine="false"
+              if echo "$tag" | grep -q "alpine"; then
+                is_alpine="true"
+              fi
+
+              # Filter architectures based on known ffmpeg package availability.
+              supported_archs=()
+              for arch in $all_archs; do
+                if supports_ffmpeg "$arch" "$is_alpine"; then
+                  supported_archs+=("$arch")
                 fi
-                
-                # Filter architectures based on ffmpeg availability (using cache)
-                supported_archs=()
-                for arch in $all_archs; do
-                  if test_ffmpeg "$arch" "$is_alpine"; then
-                    supported_archs+=("$arch")
-                  fi
-                done
-                
-                if [ ${#supported_archs[@]} -gt 0 ]; then
-                  platforms=$(IFS=,; echo "${supported_archs[*]}")
-                  merge_combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$platforms\",\"base_digest\":\"$base_digest\"}")
-                  for arch in "${supported_archs[@]}"; do
-                    platform_slug="${arch//\//-}"
-                    build_combinations+=("{\"tag\":\"$tag\",\"platform\":\"$arch\",\"platform_slug\":\"$platform_slug\",\"base_digest\":\"$base_digest\"}")
-                  done
-                  echo "  → $tag: ${#supported_archs[@]} architectures"
-                else
-                  echo "  → $tag: No supported architectures, skipping"
-                fi
+              done
+
+              if [ ${#supported_archs[@]} -gt 0 ]; then
+                platforms=$(IFS=,; echo "${supported_archs[*]}")
+                build_combinations+=("{\"tag\":\"$tag\",\"platforms\":\"$platforms\",\"base_digest\":\"$base_digest\"}")
+                echo "  → $tag: ${#supported_archs[@]} architectures"
+              else
+                echo "  → $tag: No supported architectures, skipping"
               fi
             fi
           done
           echo "build_matrix={\"include\":[$(IFS=,; echo "${build_combinations[*]}")]}" >> $GITHUB_OUTPUT
-          echo "merge_matrix={\"include\":[$(IFS=,; echo "${merge_combinations[*]}")]}" >> $GITHUB_OUTPUT
 
   build:
     needs: detect
@@ -128,7 +154,7 @@ jobs:
     strategy:
       matrix: ${{fromJson(needs.detect.outputs.build_matrix)}}
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 2
 
     steps:
       - name: Checkout repo
@@ -146,75 +172,77 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and Push Nextcloud Image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          build-args: |
-            IMAGE=nextcloud
-            TAG=${{ matrix.tag }}
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/nextcloud,push-by-digest=true,name-canonical=true,push=true
-          provenance: false
-          sbom: false
-          labels: |
-            org.opencontainers.image.base.digest=${{ matrix.base_digest }}
-
-      - name: Export image descriptor
-        env:
-          METADATA: ${{ steps.build.outputs.metadata }}
-          PLATFORM_SLUG: ${{ matrix.platform_slug }}
-        run: |
-          mkdir -p /tmp/descriptors
-          descriptor_file="/tmp/descriptors/${PLATFORM_SLUG}.json"
-          printf '%s' "$METADATA" | jq -e '."containerimage.descriptor"' > "$descriptor_file"
-          digest=$(jq -r '.digest // ""' "$descriptor_file")
-          media_type=$(jq -r '.mediaType // ""' "$descriptor_file")
-          size=$(jq -r '.size // ""' "$descriptor_file")
-          platform=$(jq -r '.platform | [.os, .architecture, .variant // empty] | join("/")' "$descriptor_file")
-          if [ -z "$digest" ] || [ -z "$media_type" ] || [ -z "$size" ] || [ -z "$platform" ]; then
-            echo "Build did not produce a complete image descriptor"
-            cat "$descriptor_file"
-            exit 1
-          fi
-          echo "Exported $platform descriptor: $digest"
-
-      - name: Upload image descriptor
-        uses: actions/upload-artifact@v4
-        with:
-          name: descriptors-${{ matrix.tag }}--${{ matrix.platform_slug }}
-          path: /tmp/descriptors/*.json
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    needs: [detect, build]
-    runs-on: ubuntu-latest
-    if: ${{ needs.detect.outputs.merge_matrix != '{"include":[]}' }}
-    strategy:
-      matrix: ${{fromJson(needs.detect.outputs.merge_matrix)}}
-      fail-fast: false
-      max-parallel: 1
-
-    steps:
-      - name: Download image descriptors
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/descriptors
-          pattern: descriptors-${{ matrix.tag }}--*
-          merge-multiple: true
-
-      - name: Create and Push Multi-Arch Manifest
+      - name: Build Platforms and Publish Manifest
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud
           TAG: ${{ matrix.tag }}
           PLATFORMS: ${{ matrix.platforms }}
+          BASE_DIGEST: ${{ matrix.base_digest }}
         run: |
           IFS=',' read -r -a expected_platforms <<< "$PLATFORMS"
+          mkdir -p /tmp/descriptors
+          normalize_platform() {
+            case "$1" in
+              linux/arm64/v8)
+                echo "linux/arm64"
+                ;;
+              *)
+                echo "$1"
+                ;;
+            esac
+          }
+
+          for platform in "${expected_platforms[@]}"; do
+            platform_slug="${platform//\//-}"
+            metadata_file="/tmp/metadata-${platform_slug}.json"
+            descriptor_file="/tmp/descriptors/${platform_slug}.json"
+
+            for attempt in {1..5}; do
+              if docker buildx build \
+                --build-arg IMAGE=nextcloud \
+                --build-arg "TAG=${TAG}" \
+                --file Dockerfile \
+                --label "org.opencontainers.image.base.digest=${BASE_DIGEST}" \
+                --output "type=image,name=${REPOSITORY},push-by-digest=true,name-canonical=true,push=true" \
+                --platform "$platform" \
+                --provenance=false \
+                --sbom=false \
+                --metadata-file "$metadata_file" \
+                .; then
+                break
+              fi
+
+              if [ "$attempt" -eq 5 ]; then
+                echo "Build failed for $TAG on $platform after $attempt attempts"
+                exit 1
+              fi
+
+              sleep_seconds=$((attempt * 120))
+              echo "Build failed for $TAG on $platform at attempt $attempt; retrying in ${sleep_seconds}s"
+              sleep "$sleep_seconds"
+            done
+
+            jq -e '."containerimage.descriptor"' "$metadata_file" > "$descriptor_file"
+            digest=$(jq -r '.digest // ""' "$descriptor_file")
+            media_type=$(jq -r '.mediaType // ""' "$descriptor_file")
+            size=$(jq -r '.size // ""' "$descriptor_file")
+            descriptor_platform=$(jq -r '.platform | [.os, .architecture, .variant // empty] | join("/")' "$descriptor_file")
+            if [ -z "$digest" ] || [ -z "$media_type" ] || [ -z "$size" ] || [ -z "$descriptor_platform" ]; then
+              echo "Build did not produce a complete image descriptor for $TAG on $platform"
+              cat "$descriptor_file"
+              exit 1
+            fi
+            if [ "$(normalize_platform "$descriptor_platform")" != "$(normalize_platform "$platform")" ]; then
+              echo "Descriptor platform mismatch for $TAG: expected $platform, got $descriptor_platform"
+              cat "$descriptor_file"
+              exit 1
+            fi
+            echo "Exported $descriptor_platform descriptor: $digest"
+            docker buildx prune -af || true
+          done
+
           mapfile -t descriptor_files < <(find /tmp/descriptors -type f -name '*.json' | sort)
           if [ ${#descriptor_files[@]} -eq 0 ]; then
             echo "No image descriptors found for $TAG"
