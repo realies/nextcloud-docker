@@ -162,17 +162,30 @@ jobs:
           labels: |
             org.opencontainers.image.base.digest=${{ matrix.base_digest }}
 
-      - name: Export image digest
+      - name: Export image descriptor
+        env:
+          METADATA: ${{ steps.build.outputs.metadata }}
+          PLATFORM_SLUG: ${{ matrix.platform_slug }}
         run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          mkdir -p /tmp/descriptors
+          descriptor_file="/tmp/descriptors/${PLATFORM_SLUG}.json"
+          printf '%s' "$METADATA" | jq -e '."containerimage.descriptor"' > "$descriptor_file"
+          digest=$(jq -r '.digest // ""' "$descriptor_file")
+          media_type=$(jq -r '.mediaType // ""' "$descriptor_file")
+          size=$(jq -r '.size // ""' "$descriptor_file")
+          platform=$(jq -r '.platform | [.os, .architecture, .variant // empty] | join("/")' "$descriptor_file")
+          if [ -z "$digest" ] || [ -z "$media_type" ] || [ -z "$size" ] || [ -z "$platform" ]; then
+            echo "Build did not produce a complete image descriptor"
+            cat "$descriptor_file"
+            exit 1
+          fi
+          echo "Exported $platform descriptor: $digest"
 
-      - name: Upload image digest
+      - name: Upload image descriptor
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.tag }}--${{ matrix.platform_slug }}
-          path: /tmp/digests/*
+          name: descriptors-${{ matrix.tag }}--${{ matrix.platform_slug }}
+          path: /tmp/descriptors/*.json
           if-no-files-found: error
           retention-days: 1
 
@@ -183,45 +196,74 @@ jobs:
     strategy:
       matrix: ${{fromJson(needs.detect.outputs.merge_matrix)}}
       fail-fast: false
+      max-parallel: 1
 
     steps:
-      - name: Login to DockerHub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Download image digests
+      - name: Download image descriptors
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests
-          pattern: digests-${{ matrix.tag }}--*
+          path: /tmp/descriptors
+          pattern: descriptors-${{ matrix.tag }}--*
           merge-multiple: true
 
       - name: Create and Push Multi-Arch Manifest
         env:
-          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud
+          TAG: ${{ matrix.tag }}
+          PLATFORMS: ${{ matrix.platforms }}
         run: |
-          IFS=',' read -r -a expected_platforms <<< "${{ matrix.platforms }}"
-          mapfile -t digest_files < <(find /tmp/digests -type f | sort)
-          if [ ${#digest_files[@]} -eq 0 ]; then
-            echo "No image digests found for ${{ matrix.tag }}"
+          IFS=',' read -r -a expected_platforms <<< "$PLATFORMS"
+          mapfile -t descriptor_files < <(find /tmp/descriptors -type f -name '*.json' | sort)
+          if [ ${#descriptor_files[@]} -eq 0 ]; then
+            echo "No image descriptors found for $TAG"
             exit 1
           fi
-          if [ ${#digest_files[@]} -ne ${#expected_platforms[@]} ]; then
-            echo "Expected ${#expected_platforms[@]} image digests for ${{ matrix.tag }} (${{ matrix.platforms }}), found ${#digest_files[@]}"
-            printf 'Found digest file: %s\n' "${digest_files[@]}"
+          if [ ${#descriptor_files[@]} -ne ${#expected_platforms[@]} ]; then
+            echo "Expected ${#expected_platforms[@]} image descriptors for $TAG ($PLATFORMS), found ${#descriptor_files[@]}"
+            printf 'Found descriptor file: %s\n' "${descriptor_files[@]}"
             exit 1
           fi
 
-          refs=()
-          for digest_file in "${digest_files[@]}"; do
-            refs+=("${IMAGE}@sha256:$(basename "$digest_file")")
+          manifest_file=$(mktemp)
+          jq -s '{
+            schemaVersion: 2,
+            mediaType: "application/vnd.docker.distribution.manifest.list.v2+json",
+            manifests: .
+          }' "${descriptor_files[@]}" > "$manifest_file"
+
+          token=$(curl -fsSL -u "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPOSITORY}:pull,push" | jq -r '.token')
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "Failed to obtain Docker Hub registry token"
+            exit 1
+          fi
+
+          for attempt in {1..5}; do
+            response_file=$(mktemp)
+            http_code=$(curl -sS -o "$response_file" -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/vnd.docker.distribution.manifest.list.v2+json" \
+              --data-binary "@$manifest_file" \
+              "https://registry-1.docker.io/v2/${REPOSITORY}/manifests/${TAG}") || http_code="000"
+
+            if [[ "$http_code" =~ ^2 ]]; then
+              echo "Published ${REPOSITORY}:${TAG}"
+              exit 0
+            fi
+
+            echo "Manifest push for $TAG failed with HTTP $http_code"
+            cat "$response_file"
+            if [[ "$http_code" != "429" && ! "$http_code" =~ ^5 ]]; then
+              exit 1
+            fi
+
+            sleep_seconds=$((attempt * 60))
+            echo "Manifest push for $TAG failed on attempt $attempt; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
           done
 
-          docker buildx imagetools create \
-            --tag "${IMAGE}:${{ matrix.tag }}" \
-            "${refs[@]}"
+          echo "Manifest push for $TAG failed after 5 attempts"
+          exit 1
