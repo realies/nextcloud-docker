@@ -205,9 +205,15 @@ jobs:
         env:
           IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nextcloud
         run: |
+          IFS=',' read -r -a expected_platforms <<< "${{ matrix.platforms }}"
           mapfile -t digest_files < <(find /tmp/digests -type f | sort)
           if [ ${#digest_files[@]} -eq 0 ]; then
             echo "No image digests found for ${{ matrix.tag }}"
+            exit 1
+          fi
+          if [ ${#digest_files[@]} -ne ${#expected_platforms[@]} ]; then
+            echo "Expected ${#expected_platforms[@]} image digests for ${{ matrix.tag }} (${{ matrix.platforms }}), found ${#digest_files[@]}"
+            printf 'Found digest file: %s\n' "${digest_files[@]}"
             exit 1
           fi
 
