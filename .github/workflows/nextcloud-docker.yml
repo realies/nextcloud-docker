@@ -48,7 +48,7 @@ jobs:
             local url="$2"
             local output_file="$3"
             local http_code
-            http_code=$(curl -sS -o "$output_file" -w "%{http_code}" \
+            http_code=$(curl -sSL -o "$output_file" -w "%{http_code}" \
               -H "Authorization: Bearer $token" \
               -H "Accept: $accept" \
               "$url") || http_code="000"
