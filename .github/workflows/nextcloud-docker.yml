@@ -183,6 +183,17 @@ jobs:
         run: |
           IFS=',' read -r -a expected_platforms <<< "$PLATFORMS"
           mkdir -p /tmp/descriptors
+          normalize_platform() {
+            case "$1" in
+              linux/arm64/v8)
+                echo "linux/arm64"
+                ;;
+              *)
+                echo "$1"
+                ;;
+            esac
+          }
+
           for platform in "${expected_platforms[@]}"; do
             platform_slug="${platform//\//-}"
             metadata_file="/tmp/metadata-${platform_slug}.json"
@@ -220,6 +231,11 @@ jobs:
             descriptor_platform=$(jq -r '.platform | [.os, .architecture, .variant // empty] | join("/")' "$descriptor_file")
             if [ -z "$digest" ] || [ -z "$media_type" ] || [ -z "$size" ] || [ -z "$descriptor_platform" ]; then
               echo "Build did not produce a complete image descriptor for $TAG on $platform"
+              cat "$descriptor_file"
+              exit 1
+            fi
+            if [ "$(normalize_platform "$descriptor_platform")" != "$(normalize_platform "$platform")" ]; then
+              echo "Descriptor platform mismatch for $TAG: expected $platform, got $descriptor_platform"
               cat "$descriptor_file"
               exit 1
             fi
