@@ -37,19 +37,42 @@ jobs:
           }
 
           build_combinations=()
-          upstream_tags=$(curl -fsSL "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100")
-          own_tags=$(curl -fsSL "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/nextcloud/tags?page_size=100" || echo '{"results":[]}')
+          fetch_tags() {
+            local url="$1"
+            local aggregate_file
+            aggregate_file=$(mktemp)
+            echo '{"results":[]}' > "$aggregate_file"
 
-          mapfile -t tag_records < <(jq -c '.results[] | select(.name | test("^[0-9]") | not)' <<< "$upstream_tags")
+            while [ -n "$url" ] && [ "$url" != "null" ]; do
+              local page_file
+              page_file=$(mktemp)
+              curl -fsSL "$url" -o "$page_file"
+              jq -s '{results: (.[0].results + .[1].results)}' "$aggregate_file" "$page_file" > "${aggregate_file}.next"
+              mv "${aggregate_file}.next" "$aggregate_file"
+              url=$(jq -r '.next // ""' "$page_file")
+            done
+
+            cat "$aggregate_file"
+          }
+
+          upstream_tags=$(fetch_tags "https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100")
+          own_tags=$(fetch_tags "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/nextcloud/tags?page_size=100" || echo '{"results":[]}')
+
+          # README promises non-versioned tags only; official versioned tags start with a number.
+          mapfile -t tag_records < <(jq -c '.results[] | select((.tag_status // "active") == "active") | select(.name | test("^[0-9]+([.-].*)?$") | not)' <<< "$upstream_tags")
 
           for tag_record in "${tag_records[@]}"; do
             tag=$(jq -r '.name' <<< "$tag_record")
             base_digest=$(jq -r '.digest // ""' <<< "$tag_record")
             upstream_last_updated=$(jq -r '.last_updated // ""' <<< "$tag_record")
-            own_last_updated=$(jq -r --arg tag "$tag" '.results[]? | select(.name == $tag) | .last_updated // ""' <<< "$own_tags" | head -n 1)
+            own_last_updated=$(jq -r --arg tag "$tag" '.results[]? | select((.tag_status // "active") == "active") | select(.name == $tag) | .last_updated // ""' <<< "$own_tags" | head -n 1)
 
-            if [ -z "$base_digest" ] || [ "$base_digest" = "null" ] || [ -z "$upstream_last_updated" ] || [ "$upstream_last_updated" = "null" ]; then
-              echo "Docker Hub tag metadata is incomplete for nextcloud:$tag"
+            if [ -z "$base_digest" ] || [ "$base_digest" = "null" ]; then
+              echo "Skipping tag: $tag (Docker Hub tag metadata has no digest)"
+              continue
+            fi
+            if [ -z "$upstream_last_updated" ] || [ "$upstream_last_updated" = "null" ]; then
+              echo "Docker Hub tag metadata is missing last_updated for nextcloud:$tag"
               echo "$tag_record"
               exit 1
             fi
